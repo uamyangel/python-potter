@@ -86,6 +86,16 @@ class Database:
         except Exception:
             pass
 
+        # Build NumPy arrays for Numba acceleration
+        log("Building NumPy arrays for Numba acceleration...")
+        try:
+            self.routing_graph.build_numpy_arrays()
+            log(f"  NumPy arrays built: {self.routing_graph.num_nodes:,} nodes")
+        except Exception as e:
+            log(f"  Warning: Failed to build NumPy arrays: {e}")
+            log("  Routing will fall back to pure Python (slower)")
+
+
     def read_netlist(self, netlist_name: str) -> None:
         """Read netlist file."""
         self.input_name = netlist_name

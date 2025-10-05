@@ -275,8 +275,8 @@ class Router:
                 self.failed_connections += 1
             routed_in_partition += 1
 
-            # Periodic progress logging per partition
-            if routed_in_partition % 200 == 0:
+            # Periodic progress logging per partition (reduced frequency for performance)
+            if routed_in_partition % 2000 == 0:
                 log(f"[T{tid}] Routed {routed_in_partition} conns in partition (iter {iteration+1})")
 
             # Cap per-partition work per iteration to keep system responsive

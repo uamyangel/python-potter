@@ -10,6 +10,14 @@ from ..db.database import Database
 from ..utils.log import log
 from ..global_defs import NodeType
 
+# Import Numba kernels for acceleration
+try:
+    from .numba_kernels import batch_evaluate_children
+    NUMBA_AVAILABLE = True
+except ImportError:
+    NUMBA_AVAILABLE = False
+    log("Warning: Numba not available, falling back to pure Python (slower)")
+
 
 @dataclass
 class NodeInfo:
@@ -55,6 +63,25 @@ class AStarRouter:
         self.rnode_wl_weight = rnode_wl_weight
         self.est_wl_weight = est_wl_weight
         self.sharing_weight = sharing_weight
+
+        # Cache graph arrays reference for Numba
+        self._use_numba = NUMBA_AVAILABLE and hasattr(database.routing_graph, '_numpy_arrays_built') and database.routing_graph._numpy_arrays_built
+        if self._use_numba:
+            graph = database.routing_graph
+            self._tile_x = graph.tile_x_arr
+            self._tile_y = graph.tile_y_arr
+            self._base_cost = graph.base_cost_arr
+            self._length = graph.length_arr
+            self._node_type = graph.node_type_arr
+            self._pres_cong_cost = graph.pres_cong_cost_arr
+            self._hist_cong_cost = graph.hist_cong_cost_arr
+            self._is_accessible = graph.is_accessible_arr  # numpy array for indexing
+            # Pre-allocate work arrays for batch evaluation
+            self._max_children = 128  # Typical fanout
+            self._work_valid = np.empty(self._max_children, dtype=np.bool_)
+            self._work_total_costs = np.empty(self._max_children, dtype=np.float32)
+            self._work_partial_costs = np.empty(self._max_children, dtype=np.float32)
+            self._work_sharing_factors = np.empty(self._max_children, dtype=np.float32)
 
     def route_one_connection(
         self,
@@ -184,8 +211,14 @@ class AStarRouter:
                     break
 
                 # Check accessibility
-                if not self._is_accessible(child_rnode, connection):
-                    continue
+                if self._use_numba:
+                    # Use numpy array for Numba acceleration
+                    if not self._is_accessible[child_rnode.id]:
+                        continue
+                else:
+                    # Use method call for regular Python
+                    if not self._is_accessible_method(child_rnode, connection):
+                        continue
 
                 # Check node-type specific accessibility rules
                 if not self._check_node_type_accessibility(
@@ -238,7 +271,7 @@ class AStarRouter:
 
         return routed
 
-    def _is_accessible(self, node: RouteNode, connection: Connection) -> bool:
+    def _is_accessible_method(self, node: RouteNode, connection: Connection) -> bool:
         """
         Check if node is accessible for this connection within a relaxed bbox.
         Allows exploration inside connection bbox with adaptive margin.
@@ -428,6 +461,96 @@ class AStarRouter:
         connection.is_routed = True
 
         return True
+
+
+    def _expand_children_numba(
+        self,
+        child_ids: np.ndarray,
+        connection: Connection,
+        net: Net,
+        current_partial_cost: float
+    ) -> tuple:
+        """
+        Batch evaluate children using Numba acceleration.
+
+        FIRST PRINCIPLES: Real sharing_factor calculation (no mocking).
+
+        Args:
+            child_ids: Array of child node IDs
+            connection: Connection being routed
+            net: Net for this connection
+            current_partial_cost: Accumulated cost so far
+
+        Returns:
+            (valid_children_ids, total_costs, partial_costs) arrays
+        """
+        if not self._use_numba:
+            return None  # Fall back to Python
+
+        num_children = len(child_ids)
+        if num_children == 0:
+            return (np.array([], dtype=np.int32), np.array([], dtype=np.float32), np.array([], dtype=np.float32))
+
+        # Resize work arrays if needed
+        if num_children > len(self._work_valid):
+            self._work_valid = np.empty(num_children, dtype=np.bool_)
+            self._work_total_costs = np.empty(num_children, dtype=np.float32)
+            self._work_partial_costs = np.empty(num_children, dtype=np.float32)
+            self._work_sharing_factors = np.empty(num_children, dtype=np.float32)
+
+        # CRITICAL: Compute REAL sharing factors for each child (no mock/simplification)
+        for i, child_id in enumerate(child_ids):
+            count_source_uses = net.count_connections_of_user(self.database.routing_graph.node_map[child_id])
+            self._work_sharing_factors[i] = 1.0 + self.sharing_weight * count_source_uses
+
+        # Get bbox (prefer precomputed)
+        if connection.x_min_bb is not None:
+            x_min, x_max = connection.x_min_bb, connection.x_max_bb
+            y_min, y_max = connection.y_min_bb, connection.y_max_bb
+        else:
+            margin_x, margin_y = 3, 15
+            x_min = connection.x_min - margin_x
+            x_max = connection.x_max + margin_x
+            y_min = connection.y_min - margin_y
+            y_max = connection.y_max + margin_y
+
+        # Call Numba-accelerated batch evaluation
+        num_valid = batch_evaluate_children(
+            child_ids,
+            num_children,
+            self._tile_x,
+            self._tile_y,
+            self._base_cost,
+            self._length,
+            self._node_type,
+            self._pres_cong_cost,
+            self._hist_cong_cost,
+            self._is_accessible,
+            self._work_sharing_factors,
+            x_min, y_min, x_max, y_max,
+            net.center_x, net.center_y, net.hpwl, net.num_connections,
+            connection.sink_node.id,
+            connection.sink_node.tile_x,
+            connection.sink_node.tile_y,
+            current_partial_cost,
+            self.rnode_cost_weight,
+            self.rnode_wl_weight,
+            self.est_wl_weight,
+            self._work_valid,
+            self._work_total_costs,
+            self._work_partial_costs
+        )
+
+        if num_valid == 0:
+            return (np.array([], dtype=np.int32), np.array([], dtype=np.float32), np.array([], dtype=np.float32))
+
+        # Extract valid results
+        valid_mask = self._work_valid[:num_children]
+        valid_ids = child_ids[valid_mask]
+        valid_total_costs = self._work_total_costs[:num_children][valid_mask]
+        valid_partial_costs = self._work_partial_costs[:num_children][valid_mask]
+
+        return (valid_ids, valid_total_costs, valid_partial_costs)
 
 
 class NodeScratch:
