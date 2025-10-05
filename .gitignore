@@ -1,0 +1,14 @@
+Potter/
+*.md
+*.zip
+benchmarks/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pyw
+*.pyz
+.DS_Store
+dump/
+device/
