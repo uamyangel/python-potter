@@ -94,15 +94,11 @@ def diagnose_netlist(netlist_path: str, device_path: str = None):
             from src.db.route_node_graph import RouteNodeGraph
             
             print(f"Loading device: {device_path}")
-            device = Device()
+            # Create routing graph first, then pass to Device
+            routing_graph = RouteNodeGraph()
+            device = Device(routing_graph)
             device.read(device_path)
-            print(f"Device loaded: {len(device.sites)} sites")
-            print()
-            
-            # Build routing graph
-            print("Building routing graph...")
-            graph = RouteNodeGraph(device)
-            print(f"Graph built: {len(graph.nodes)} nodes")
+            print(f"Device loaded: {len(device.sites)} sites, {device.routing_graph.num_nodes} nodes")
             print()
             
             # Check if we can resolve site pins
