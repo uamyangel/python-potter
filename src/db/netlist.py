@@ -345,64 +345,64 @@ class Netlist:
                     continue
                 net_results.setdefault(net_name, []).append(rr)
 
-                # Build new PhysNetlist
-                msg = PN.PhysNetlist.new_message()
-                msg.part = reader.part
+            # Build new PhysNetlist
+            msg = PN.PhysNetlist.new_message()
+            msg.part = reader.part
 
             # Strings
             msg.init('strList', len(str_list))
             for i, s in enumerate(str_list):
                 msg.strList[i] = s
 
-                # PhysNets: copy topology by name, attach routed PIPs as stubs
-                orig_nets = reader.physNets
-                nets_builder = msg.init('physNets', len(orig_nets))
-                for i, onet in enumerate(orig_nets):
-                    nb = nets_builder[i]
-                    nb.name = onet.name
-                    nb.type = onet.type
-                    # Build stubs from routing results for this net
-                    name = reader.strList[onet.name]
-                    results = net_results.get(name, [])
-                    nb.init('sources', len(onet.sources))
-                    for si, sbranch in enumerate(onet.sources):
-                        # Preserve original sources (site pins)
-                        sb = nb.sources[si]
-                        if sbranch.routeSegment.which() == 'sitePin':
-                            sp = sbranch.routeSegment.sitePin
-                            sb.routeSegment.init('sitePin')
-                            sb.routeSegment.sitePin.site = sp.site
-                            sb.routeSegment.sitePin.pin = sp.pin
-                        elif sbranch.routeSegment.which() == 'belPin':
-                            bp = sbranch.routeSegment.belPin
-                            sb.routeSegment.init('belPin')
-                            sb.routeSegment.belPin.site = bp.site
-                            sb.routeSegment.belPin.bel = bp.bel
-                            sb.routeSegment.belPin.pin = bp.pin
-                        else:
-                            # Default to an empty sitePin if unknown
-                            sb.routeSegment.init('sitePin')
-                            sb.routeSegment.sitePin.site = 0
-                            sb.routeSegment.sitePin.pin = 0
-                        sb.init('branches', 0)
-                    nb.init('stubs', len(results))
-                    for si, rr in enumerate(results):
-                        branch = nb.stubs[si]
-                        # Convert node path to pip chain
-                        pips = self._route_result_to_pips(rr)
-                        self._fill_branch_with_pip_chain(branch, pips, ensure_str)
-                    # Preserve empty physCells linkage
-                    nb.init('stubNodes', 0)
+            # PhysNets: copy topology by name, attach routed PIPs as stubs
+            orig_nets = reader.physNets
+            nets_builder = msg.init('physNets', len(orig_nets))
+            for i, onet in enumerate(orig_nets):
+                nb = nets_builder[i]
+                nb.name = onet.name
+                nb.type = onet.type
+                # Build stubs from routing results for this net
+                name = reader.strList[onet.name]
+                results = net_results.get(name, [])
+                nb.init('sources', len(onet.sources))
+                for si, sbranch in enumerate(onet.sources):
+                    # Preserve original sources (site pins)
+                    sb = nb.sources[si]
+                    if sbranch.routeSegment.which() == 'sitePin':
+                        sp = sbranch.routeSegment.sitePin
+                        sb.routeSegment.init('sitePin')
+                        sb.routeSegment.sitePin.site = sp.site
+                        sb.routeSegment.sitePin.pin = sp.pin
+                    elif sbranch.routeSegment.which() == 'belPin':
+                        bp = sbranch.routeSegment.belPin
+                        sb.routeSegment.init('belPin')
+                        sb.routeSegment.belPin.site = bp.site
+                        sb.routeSegment.belPin.bel = bp.bel
+                        sb.routeSegment.belPin.pin = bp.pin
+                    else:
+                        # Default to an empty sitePin if unknown
+                        sb.routeSegment.init('sitePin')
+                        sb.routeSegment.sitePin.site = 0
+                        sb.routeSegment.sitePin.pin = 0
+                    sb.init('branches', 0)
+                nb.init('stubs', len(results))
+                for si, rr in enumerate(results):
+                    branch = nb.stubs[si]
+                    # Convert node path to pip chain
+                    pips = self._route_result_to_pips(rr)
+                    self._fill_branch_with_pip_chain(branch, pips, ensure_str)
+                # Preserve empty physCells linkage
+                nb.init('stubNodes', 0)
 
-                # Minimal other sections left empty; tools may accept this
-                msg.init('placements', 0)
-                msg.init('physCells', 0)
-                msg.init('siteInsts', 0)
-                msg.init('properties', 0)
-                # Null net: copy as empty
-                msg.nullNet.name = reader.nullNet.name if hasattr(reader, 'nullNet') else 0
-                msg.nullNet.init('sources', 0)
-                msg.nullNet.init('stubs', 0)
+            # Minimal other sections left empty; tools may accept this
+            msg.init('placements', 0)
+            msg.init('physCells', 0)
+            msg.init('siteInsts', 0)
+            msg.init('properties', 0)
+            # Null net: copy as empty
+            msg.nullNet.name = reader.nullNet.name if hasattr(reader, 'nullNet') else 0
+            msg.nullNet.init('sources', 0)
+            msg.nullNet.init('stubs', 0)
 
             # Write gzipped output
             out_bytes = msg.to_bytes()
