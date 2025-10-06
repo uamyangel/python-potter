@@ -69,14 +69,25 @@ def init_worker(
     _worker_graph.num_nodes = database_state['num_nodes']
     _worker_graph.num_edges = database_state['num_edges']
 
-    # Restore CSR adjacency (small - can be pickled)
-    _worker_graph.csr_indptr = database_state['csr_indptr']
-    _worker_graph.csr_indices = database_state['csr_indices']
+    # Restore CSR adjacency from shared memory (ZERO-COPY!)
+    shm_metadata = database_state['shared_arrays']
+    _worker_graph.csr_indptr, shm = attach_shared_array(
+        shm_metadata['csr_indptr']['shm_name'],
+        shm_metadata['csr_indptr']['shape'],
+        shm_metadata['csr_indptr']['dtype']
+    )
+    _worker_shm_refs.append(shm)
+    
+    _worker_graph.csr_indices, shm = attach_shared_array(
+        shm_metadata['csr_indices']['shm_name'],
+        shm_metadata['csr_indices']['shape'],
+        shm_metadata['csr_indices']['dtype']
+    )
+    _worker_shm_refs.append(shm)
     _worker_graph._has_csr = True
 
     # Attach to shared NumPy arrays (ZERO-COPY!)
     # CRITICAL: Keep SharedMemory references alive to prevent segfault!
-    shm_metadata = database_state['shared_arrays']
     
     _worker_graph.tile_x_arr, shm = attach_shared_array(
         shm_metadata['tile_x']['shm_name'],
@@ -344,14 +355,15 @@ def prepare_database_state(database: Database, shm_manager) -> Dict:
     """
     Extract minimal database state for worker initialization.
 
-    FIRST PRINCIPLES: Use shared memory for large arrays, pickle small metadata.
-    - Large NumPy arrays (hundreds of MB): shared memory (zero-copy)
-    - Small data (CSR indices, metadata): pickled (acceptable overhead)
+    FIRST PRINCIPLES: Use shared memory for ALL large arrays (>10MB).
+    - Large NumPy arrays: shared memory (zero-copy)
+    - Large CSR indices: shared memory (zero-copy) ← CRITICAL FIX!
+    - Small metadata (<1MB): pickled (acceptable overhead)
     - No object references (RouteNode.children/parents avoided)
     
     Memory scaling:
     - Old approach: O(n × num_workers) - each worker gets full copy
-    - New approach: O(n) - arrays shared, only metadata copied
+    - New approach: O(n) - all large data shared, only small metadata copied
 
     Args:
         database: Full database object
@@ -369,21 +381,13 @@ def prepare_database_state(database: Database, shm_manager) -> Dict:
         'num_edges': graph.num_edges,
     }
 
-    # Add CSR adjacency (relatively small - can be pickled)
-    if graph._has_csr:
-        state['csr_indptr'] = graph.csr_indptr
-        state['csr_indices'] = graph.csr_indices
-    else:
-        # Must have CSR for multiprocessing (no object references)
-        raise RuntimeError("CSR not built! Call routing_graph.build_csr() before multiprocessing")
-
     # Create shared memory for large NumPy arrays
     if not graph._numpy_arrays_built:
         raise RuntimeError("NumPy arrays not built! Call routing_graph.build_numpy_arrays() before multiprocessing")
     
     log("  Creating shared memory for NumPy arrays...")
     
-    # Create shared arrays (ZERO-COPY for all workers!)
+    # Create shared arrays for node attributes (ZERO-COPY for all workers!)
     array_names = [
         'tile_x', 'tile_y', 'base_cost', 'length',
         'node_type', 'intent_code', 'capacity',
@@ -396,7 +400,22 @@ def prepare_database_state(database: Database, shm_manager) -> Dict:
         shm_manager.create_shared_array(name, arr)
         total_bytes += arr.nbytes
     
-    log(f"  Shared memory created: {total_bytes / 1024 / 1024:.1f} MB")
+    # CRITICAL FIX: Also share CSR indices/indptr (can be 500+ MB!)
+    if graph._has_csr:
+        # Convert to numpy arrays if they're lists
+        csr_indptr_arr = np.array(graph.csr_indptr, dtype=np.int32) if isinstance(graph.csr_indptr, list) else graph.csr_indptr
+        csr_indices_arr = np.array(graph.csr_indices, dtype=np.int32) if isinstance(graph.csr_indices, list) else graph.csr_indices
+        
+        shm_manager.create_shared_array('csr_indptr', csr_indptr_arr)
+        shm_manager.create_shared_array('csr_indices', csr_indices_arr)
+        
+        total_bytes += csr_indptr_arr.nbytes + csr_indices_arr.nbytes
+        log(f"  CSR shared: indptr {csr_indptr_arr.nbytes/1024/1024:.1f} MB, indices {csr_indices_arr.nbytes/1024/1024:.1f} MB")
+    else:
+        # Must have CSR for multiprocessing (no object references)
+        raise RuntimeError("CSR not built! Call routing_graph.build_csr() before multiprocessing")
+    
+    log(f"  Total shared memory: {total_bytes / 1024 / 1024:.1f} MB")
     
     # Store shared array metadata (only names + shapes + dtypes - small!)
     state['shared_arrays'] = shm_manager.get_shared_arrays_metadata()
