@@ -53,6 +53,12 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--use_threads",
+        action="store_true",
+        help="Use threading instead of multiprocessing (default: multiprocessing for better performance)"
+    )
+
+    parser.add_argument(
         "--device_cache",
         choices=["off", "light"],
         default="light",
@@ -111,13 +117,14 @@ def main() -> int:
     # Print banner
     log("=" * 60)
     log("Potter - Parallel Overlap-Tolerant Router")
-    log("Python Implementation")
+    log("Python Implementation (Optimized)")
     log("=" * 60)
     log(f"Input:  {args.input}")
     log(f"Output: {args.output}")
     log(f"Device: {args.device}")
     log(f"Threads: {args.thread}")
     log(f"Mode: {'Runtime-first' if args.runtime_first else 'Stability-first'}")
+    log(f"Parallelism: {'Threading' if args.use_threads else 'Multiprocessing (GIL-free)'}")
     log()
 
     # Validate input files
@@ -142,7 +149,7 @@ def main() -> int:
         database.print_statistic()
 
         # Route
-        router = Router(database, args.runtime_first)
+        router = Router(database, args.runtime_first, use_multiprocessing=not args.use_threads)
         # Allow overriding iteration count from CLI
         if hasattr(args, 'max_iter') and args.max_iter is not None:
             router.max_iter = max(1, int(args.max_iter))

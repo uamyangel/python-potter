@@ -1,22 +1,32 @@
 """Main routing coordinator with parallel support."""
 
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Dict, List
+import numpy as np
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from typing import Dict, List, Optional
 from ..db.database import Database
 from ..db.route_node import Connection, RouteResult, Net
 from .astar_route import AStarRouter, NodeInfo, NodeScratch
 from .partition_tree import PartitionTree, PartitionBBox
+from .process_worker import (
+    init_worker,
+    route_partition_worker,
+    prepare_database_state,
+    extract_partition_connections
+)
+from .shared_memory_manager import SharedMemoryManager
 from ..utils.log import log
+from ..utils.memory_monitor import log_memory_usage
 
 
 class Router:
     """Main router coordinating parallel routing."""
 
-    def __init__(self, database: Database, is_runtime_first: bool = False):
+    def __init__(self, database: Database, is_runtime_first: bool = False, use_multiprocessing: bool = True):
         self.database = database
         self.is_runtime_first = is_runtime_first
         self.num_thread = database.get_num_thread()
+        self.use_multiprocessing = use_multiprocessing  # New: toggle for process vs thread
 
         # Routing parameters
         self.max_iter = 500
@@ -36,20 +46,32 @@ class Router:
         self.node_routing_results: List[RouteResult] = []
 
         # Per-thread data (array-backed scratch for speed)
+        # Only needed for thread-based routing
         num_nodes = self.database.routing_graph.num_nodes
-        self.node_info_per_thread: List[NodeScratch] = [
-            NodeScratch(num_nodes) for _ in range(self.num_thread)
-        ]
+        if not use_multiprocessing:
+            self.node_info_per_thread: List[NodeScratch] = [
+                NodeScratch(num_nodes) for _ in range(self.num_thread)
+            ]
+            # Router instances per thread
+            self.routers_per_thread: List[AStarRouter] = [
+                AStarRouter(
+                    database,
+                    self.present_cong_factor,
+                    self.historical_cong_factor
+                )
+                for _ in range(self.num_thread)
+            ]
+        else:
+            self.node_info_per_thread = []
+            self.routers_per_thread = []
+            # Create shared memory manager for zero-copy multiprocessing
+            self._shm_manager: Optional[SharedMemoryManager] = SharedMemoryManager()
+            # Prepare database state for worker processes
+            log("Preparing database state for multiprocessing (with shared memory)...")
+            self._database_state = prepare_database_state(database, self._shm_manager)
+            log(f"  Database state prepared: {self._database_state['num_nodes']:,} nodes")
+            log(f"  Memory model: Shared (zero-copy across {self.num_thread} processes)")
 
-        # Router instances per thread
-        self.routers_per_thread: List[AStarRouter] = [
-            AStarRouter(
-                database,
-                self.present_cong_factor,
-                self.historical_cong_factor
-            )
-            for _ in range(self.num_thread)
-        ]
         # Per-partition cap to avoid stalls (process all by default)
         self.max_conns_per_partition = None  # route all connections in a partition per iteration
 
@@ -57,35 +79,52 @@ class Router:
         self._overused_nodes: set[int] = set()
         self._rerouted_this_iter: int = 0
 
+        # Convergence tracking for early stop
+        self._prev_overused_count = float('inf')
+        self._stall_iterations = 0
+        self._convergence_threshold = 0.01  # 1% improvement threshold
+
     def route(self) -> None:
         """Main routing entry point."""
         log("=" * 60)
         mode = "runtime-first" if self.is_runtime_first else "stability-first"
-        log(f"Starting routing ({mode} mode)")
-        log(f"Threads: {self.num_thread}")
+        parallelism = "multiprocessing" if self.use_multiprocessing else "threading"
+        log(f"Starting routing ({mode} mode, {parallelism})")
+        log(f"Threads/Processes: {self.num_thread}")
         log("=" * 60)
+        
+        # Log initial memory usage
+        log_memory_usage("Initial memory: ")
 
         start_time = time.time()
 
-        # Ensure connection bounding boxes are prepared (if not precomputed via CLI)
-        # Only compute when missing to respect CLI-provided margins
-        if not self._has_prepared_bboxes():
-            self._prepare_connection_bboxes(x_margin=3, y_margin=15)
+        try:
+            # Ensure connection bounding boxes are prepared (if not precomputed via CLI)
+            # Only compute when missing to respect CLI-provided margins
+            if not self._has_prepared_bboxes():
+                self._prepare_connection_bboxes(x_margin=3, y_margin=15)
 
-        if self.is_runtime_first:
-            self._runtime_first_routing()
-        else:
-            self._stable_first_routing()
+            if self.is_runtime_first:
+                self._runtime_first_routing()
+            else:
+                self._stable_first_routing()
 
-        elapsed = time.time() - start_time
+            elapsed = time.time() - start_time
 
-        log("=" * 60)
-        log("Routing completed:")
-        log(f"  Time: {elapsed:.2f}s")
-        log(f"  Routed connections: {self.routed_connections}")
-        log(f"  Failed connections: {self.failed_connections}")
-        log(f"  Total wirelength: {self.total_wirelength}")
-        log("=" * 60)
+            log("=" * 60)
+            log("Routing completed:")
+            log(f"  Time: {elapsed:.2f}s")
+            log(f"  Routed connections: {self.routed_connections}")
+            log(f"  Failed connections: {self.failed_connections}")
+            log(f"  Total wirelength: {self.total_wirelength}")
+            log("=" * 60)
+            
+            # Log final memory usage
+            log_memory_usage("Final memory: ")
+            
+        finally:
+            # Clean up shared memory
+            self._cleanup_shared_memory()
 
     def _stable_first_routing(self) -> None:
         """Stability-first (deterministic) parallel routing."""
@@ -145,17 +184,35 @@ class Router:
             log(f"  Overused nodes: {num_overused}")
             log(f"  Rerouted: {self._rerouted_this_iter} connections")
             log(f"  Iteration time: {iter_time:.2f}s")
+            
+            # Log memory usage every 10 iterations
+            if (iteration + 1) % 10 == 0:
+                log_memory_usage("  Memory: ")
 
             if num_overused == 0:
                 log("Routing converged - no overused nodes")
                 break
 
+            # OPTIMIZATION: Early stop if no progress
             if self._rerouted_this_iter == 0:
                 log("  No connections re-routed this iteration; early stop")
                 break
 
-            # Update congestion schedule and historical costs
-            self._update_congestion_costs()
+            # OPTIMIZATION: Convergence detection - stop if improvement is too slow
+            improvement_rate = (self._prev_overused_count - num_overused) / max(1, self._prev_overused_count)
+            if improvement_rate < self._convergence_threshold and iteration > 10:
+                self._stall_iterations += 1
+                log(f"  Convergence stalled (improvement: {improvement_rate:.1%})")
+                if self._stall_iterations >= 3:
+                    log("  Convergence stalled for 3 iterations - early stop")
+                    break
+            else:
+                self._stall_iterations = 0
+
+            self._prev_overused_count = num_overused
+
+            # Update congestion schedule (with adaptive adjustment)
+            self._update_congestion_costs_adaptive(improvement_rate)
 
         self._save_all_routing_solutions()
 
@@ -207,12 +264,22 @@ class Router:
         partitions: List,
         iteration: int
     ) -> None:
-        """Route partitions in parallel with exclusive per-thread state.
+        """Route partitions in parallel with exclusive per-worker state.
 
-        Spawns exactly `num_thread` workers. Each worker owns a unique `tid`
-        and processes multiple partitions sequentially to avoid concurrent use of
-        per-thread A* router and node_infos.
+        Uses ProcessPoolExecutor for true parallelism (bypassing GIL) when
+        use_multiprocessing=True, otherwise falls back to ThreadPoolExecutor.
         """
+        if self.use_multiprocessing:
+            self._route_partitions_multiprocess(partitions, iteration)
+        else:
+            self._route_partitions_threaded(partitions, iteration)
+
+    def _route_partitions_threaded(
+        self,
+        partitions: List,
+        iteration: int
+    ) -> None:
+        """Thread-based parallel routing (original implementation)."""
         from queue import Queue, Empty
 
         q: Queue = Queue()
@@ -234,6 +301,118 @@ class Router:
             futures = [executor.submit(worker, tid) for tid in range(self.num_thread)]
             for future in as_completed(futures):
                 future.result()
+
+    def _route_partitions_multiprocess(
+        self,
+        partitions: List,
+        iteration: int
+    ) -> None:
+        """
+        Process-based parallel routing (GIL-free).
+
+        Each partition is routed in a separate process. Results are collected
+        and merged back into the main database.
+        """
+        # Extract lightweight connection identifiers from partitions
+        partition_tasks = []
+        for partition in partitions:
+            conn_tuples = extract_partition_connections(partition, self._conns_by_leaf)
+            if conn_tuples:
+                partition_tasks.append(conn_tuples)
+
+        if not partition_tasks:
+            return
+
+        # Create worker initializer function with current congestion factors
+        from functools import partial
+        worker_init = partial(
+            init_worker,
+            self._database_state,
+            present_cong_factor=self.present_cong_factor,
+            historical_cong_factor=self.historical_cong_factor
+        )
+
+        # Route partitions in parallel using processes
+        results = []
+        with ProcessPoolExecutor(
+            max_workers=self.num_thread,
+            initializer=worker_init,
+            initargs=(0,)  # worker_id will be set by executor
+        ) as executor:
+            futures = []
+            for worker_id, task in enumerate(partition_tasks):
+                # Re-initialize worker with correct ID
+                future = executor.submit(
+                    route_partition_worker,
+                    task,
+                    iteration,
+                    self.connection_id_base,
+                    needs_ripup=(iteration > 0)
+                )
+                futures.append(future)
+
+            # Collect results
+            for future in as_completed(futures):
+                result = future.result()
+                results.append(result)
+
+        # Merge results back into main database
+        self._merge_worker_results(results)
+
+    def _merge_worker_results(self, results: List[Dict]) -> None:
+        """
+        Merge routing results from worker processes back into main database.
+
+        Args:
+            results: List of result dictionaries from workers
+        """
+        for result in results:
+            worker_id = result['worker_id']
+            routed_count = result['routed_count']
+            failed_count = result['failed_count']
+            rerouted_count = result['rerouted_count']
+
+            # Update statistics
+            self.routed_connections += routed_count
+            self.failed_connections += failed_count
+            self._rerouted_this_iter += rerouted_count
+
+            # Restore routed paths to Connection objects
+            for net_id, conn_id, node_ids in result['routed_paths']:
+                net = self.database.nets[net_id]
+                connection = net.connections[conn_id]
+
+                # Reconstruct route_nodes from node IDs
+                connection.route_nodes = [
+                    self.database.routing_graph.node_map[nid] for nid in node_ids
+                ]
+                connection.is_routed = True
+
+                # Update overuse tracking
+                for rnode in connection.route_nodes:
+                    self._update_overuse_for_node(rnode)
+
+            # Merge node usage updates
+            for node_id, net_usage in result['node_usage_updates'].items():
+                node = self.database.routing_graph.node_map.get(node_id)
+                if node is None:
+                    continue
+
+                # Update node's user connection counts
+                for net_id, count in net_usage.items():
+                    if net_id not in node.users_connection_counts:
+                        node.users_connection_counts[net_id] = 0
+                    node.users_connection_counts[net_id] += count
+
+                    # Update net's user tracking
+                    net = self.database.nets[net_id]
+                    if node.id not in net.users_connection_counts:
+                        net.users_connection_counts[node.id] = 0
+                    net.users_connection_counts[node.id] += count
+
+                # Update present congestion cost
+                node.update_present_congestion_cost(self.present_cong_factor)
+
 
     def _route_partition(self, partition, iteration: int, tid: int) -> None:
         """Route all connections in a partition."""
@@ -326,8 +505,101 @@ class Router:
         # Use incrementally-maintained set (avoids full graph scan)
         return len(self._overused_nodes)
 
+    def _update_congestion_costs_adaptive(self, improvement_rate: float) -> None:
+        """
+        Escalate pres_fac adaptively based on convergence rate.
+
+        OPTIMIZATION: Adaptive scheduling
+        - Fast convergence: reduce multiplier (avoid over-penalizing)
+        - Slow convergence: increase multiplier (accelerate resolution)
+        """
+        # Adaptive multiplier adjustment
+        if improvement_rate > 0.15:  # Fast convergence (>15% improvement)
+            # Reduce aggressiveness
+            actual_multiplier = self.present_cong_multiplier * 0.9
+        elif improvement_rate < 0.03:  # Very slow (<3% improvement)
+            # Increase aggressiveness
+            actual_multiplier = self.present_cong_multiplier * 1.1
+        else:
+            actual_multiplier = self.present_cong_multiplier
+
+        # Increase global present congestion factor for next iteration
+        self.present_cong_factor = min(
+            self.present_cong_factor * actual_multiplier,
+            self.max_present_cong_factor,
+        )
+
+        # Propagate updated pres_fac to thread-local A* routers (if using threading)
+        if not self.use_multiprocessing:
+            for r in self.routers_per_thread:
+                r.present_cong_factor = self.present_cong_factor
+
+        # OPTIMIZATION: Use Numba batch update for congestion costs
+        self._update_congestion_costs_batch_numba()
+
+    def _update_congestion_costs_batch_numba(self) -> None:
+        """
+        Batch update congestion costs using Numba (OPTIMIZATION).
+
+        Only updates nodes in the overuse set (dirty nodes), avoiding full graph scan.
+        """
+        if len(self._overused_nodes) == 0:
+            return
+
+        pres = self.present_cong_factor
+        hist_fac = self.historical_cong_factor
+
+        # Check if Numba batch update is available
+        graph = self.database.routing_graph
+        if graph._numpy_arrays_built:
+            try:
+                from .numba_kernels import update_congestion_costs_batch
+
+                # Collect node IDs to update
+                node_ids_arr = np.array(list(self._overused_nodes), dtype=np.int32)
+
+                # Build occupancy array (need to sync from RouteNode objects)
+                occupancy_arr = np.zeros(graph.num_nodes, dtype=np.int32)
+                for node in graph.nodes:
+                    occupancy_arr[node.id] = node.occupancy
+
+                # Batch update using Numba
+                update_congestion_costs_batch(
+                    node_ids_arr,
+                    len(node_ids_arr),
+                    occupancy_arr,
+                    graph.capacity_arr,
+                    pres,
+                    hist_fac,
+                    graph.pres_cong_cost_arr,  # Modified in-place
+                    graph.hist_cong_cost_arr   # Modified in-place
+                )
+
+                # Sync back to RouteNode objects
+                for node_id in node_ids_arr:
+                    node = graph.node_map.get(node_id)
+                    if node:
+                        node.present_congestion_cost = graph.pres_cong_cost_arr[node_id]
+                        node.historical_congestion_cost = graph.hist_cong_cost_arr[node_id]
+
+                return  # Success - Numba path taken
+            except Exception as e:
+                log(f"Warning: Numba batch update failed: {e}, falling back to Python")
+
+        # Fallback: Python loop (original implementation)
+        for node_id in self._overused_nodes:
+            node = self.database.routing_graph.node_map.get(node_id)
+            if node is None:
+                continue
+            overuse = node.occupancy - node.capacity
+            if overuse <= 0:
+                node.present_congestion_cost = 1.0 + pres
+            else:
+                node.present_congestion_cost = 1.0 + (overuse + 1) * pres
+                node.historical_congestion_cost += overuse * hist_fac
+
     def _update_congestion_costs(self) -> None:
-        """Escalate pres_fac globally and recompute present/historical costs (PathFinder-like)."""
+        """Legacy congestion cost update (non-adaptive)."""
         # Increase global present congestion factor for next iteration
         self.present_cong_factor = min(
             self.present_cong_factor * self.present_cong_multiplier,
@@ -397,3 +669,11 @@ class Router:
             for conn in net.connections:
                 return conn.x_min_bb is not None
         return False
+    
+    def _cleanup_shared_memory(self) -> None:
+        """Clean up shared memory resources."""
+        if self.use_multiprocessing and hasattr(self, '_shm_manager') and self._shm_manager is not None:
+            log("Cleaning up shared memory...")
+            self._shm_manager.cleanup()
+            self._shm_manager = None
+            log("  Shared memory cleaned up successfully")

@@ -11,8 +11,160 @@ FIRST PRINCIPLES:
 """
 
 import numpy as np
-from numba import jit, int32, float32, int16, boolean
+from numba import jit, int32, float32, float64, int16, boolean
 from ..global_defs import NodeType
+
+
+# ============================================================================
+# Numba Priority Queue (Binary Min-Heap) Implementation
+# ============================================================================
+# Uses NumPy arrays for O(1) indexing with Numba JIT compilation
+
+
+@jit(nopython=True, cache=True)
+def _heap_sift_up(heap_costs: np.ndarray, heap_node_ids: np.ndarray, pos: int):
+    """
+    Sift element at pos up to restore heap property.
+
+    Args:
+        heap_costs: Array of costs (min-heap on this)
+        heap_node_ids: Corresponding node IDs
+        pos: Position to sift up from
+    """
+    # Standard binary heap sift-up
+    while pos > 0:
+        parent = (pos - 1) // 2
+        if heap_costs[pos] < heap_costs[parent]:
+            # Swap with parent
+            heap_costs[pos], heap_costs[parent] = heap_costs[parent], heap_costs[pos]
+            heap_node_ids[pos], heap_node_ids[parent] = heap_node_ids[parent], heap_node_ids[pos]
+            pos = parent
+        else:
+            break
+
+
+@jit(nopython=True, cache=True)
+def _heap_sift_down(heap_costs: np.ndarray, heap_node_ids: np.ndarray, pos: int, size: int):
+    """
+    Sift element at pos down to restore heap property.
+
+    Args:
+        heap_costs: Array of costs
+        heap_node_ids: Corresponding node IDs
+        pos: Position to sift down from
+        size: Current heap size
+    """
+    while True:
+        left = 2 * pos + 1
+        right = 2 * pos + 2
+        smallest = pos
+
+        if left < size and heap_costs[left] < heap_costs[smallest]:
+            smallest = left
+        if right < size and heap_costs[right] < heap_costs[smallest]:
+            smallest = right
+
+        if smallest == pos:
+            break
+
+        # Swap with smallest child
+        heap_costs[pos], heap_costs[smallest] = heap_costs[smallest], heap_costs[pos]
+        heap_node_ids[pos], heap_node_ids[smallest] = heap_node_ids[smallest], heap_node_ids[pos]
+        pos = smallest
+
+
+@jit(nopython=True, cache=True)
+def numba_heap_push(
+    heap_costs: np.ndarray,
+    heap_node_ids: np.ndarray,
+    size: int,
+    cost: float,
+    node_id: int
+) -> int:
+    """
+    Push (cost, node_id) onto heap.
+
+    Args:
+        heap_costs: Cost array (modified in-place)
+        heap_node_ids: Node ID array (modified in-place)
+        size: Current heap size
+        cost: Cost to push
+        node_id: Node ID to push
+
+    Returns:
+        New heap size
+    """
+    if size >= len(heap_costs):
+        # Heap full - caller should handle (resize or error)
+        return size
+
+    # Insert at end
+    heap_costs[size] = cost
+    heap_node_ids[size] = node_id
+
+    # Sift up
+    _heap_sift_up(heap_costs, heap_node_ids, size)
+
+    return size + 1
+
+
+@jit(nopython=True, cache=True)
+def numba_heap_pop(
+    heap_costs: np.ndarray,
+    heap_node_ids: np.ndarray,
+    size: int
+) -> tuple:
+    """
+    Pop minimum (cost, node_id) from heap.
+
+    Args:
+        heap_costs: Cost array (modified in-place)
+        heap_node_ids: Node ID array (modified in-place)
+        size: Current heap size
+
+    Returns:
+        (new_size, min_cost, min_node_id)
+        Returns (-1, inf, -1) if heap is empty
+    """
+    if size == 0:
+        return (-1, np.float32(np.inf), -1)
+
+    # Extract root
+    min_cost = heap_costs[0]
+    min_node_id = heap_node_ids[0]
+
+    # Move last element to root
+    new_size = size - 1
+    if new_size > 0:
+        heap_costs[0] = heap_costs[new_size]
+        heap_node_ids[0] = heap_node_ids[new_size]
+
+        # Sift down
+        _heap_sift_down(heap_costs, heap_node_ids, 0, new_size)
+
+    return (new_size, min_cost, min_node_id)
+
+
+@jit(nopython=True, cache=True)
+def numba_heap_peek(
+    heap_costs: np.ndarray,
+    heap_node_ids: np.ndarray,
+    size: int
+) -> tuple:
+    """
+    Peek at minimum without removing.
+
+    Returns:
+        (cost, node_id) or (inf, -1) if empty
+    """
+    if size == 0:
+        return (np.float32(np.inf), -1)
+    return (heap_costs[0], heap_node_ids[0])
+
+
+# ============================================================================
+# Original Kernels
+# ============================================================================
 
 
 @jit(nopython=True, cache=True)

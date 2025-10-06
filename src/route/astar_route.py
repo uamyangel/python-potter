@@ -12,7 +12,12 @@ from ..global_defs import NodeType
 
 # Import Numba kernels for acceleration
 try:
-    from .numba_kernels import batch_evaluate_children
+    from .numba_kernels import (
+        batch_evaluate_children,
+        numba_heap_push,
+        numba_heap_pop,
+        numba_heap_peek
+    )
     NUMBA_AVAILABLE = True
 except ImportError:
     NUMBA_AVAILABLE = False
@@ -54,7 +59,8 @@ class AStarRouter:
         rnode_cost_weight: float = 1.0,
         rnode_wl_weight: float = 0.2,
         est_wl_weight: float = 0.8,
-        sharing_weight: float = 1.0
+        sharing_weight: float = 1.0,
+        use_numba_heap: bool = True  # New: enable Numba heap for 2-3x speedup
     ):
         self.database = database
         self.present_cong_factor = present_cong_factor
@@ -63,6 +69,7 @@ class AStarRouter:
         self.rnode_wl_weight = rnode_wl_weight
         self.est_wl_weight = est_wl_weight
         self.sharing_weight = sharing_weight
+        self.use_numba_heap = use_numba_heap and NUMBA_AVAILABLE
 
         # Cache graph arrays reference for Numba
         self._use_numba = NUMBA_AVAILABLE and hasattr(database.routing_graph, '_numpy_arrays_built') and database.routing_graph._numpy_arrays_built
@@ -82,6 +89,13 @@ class AStarRouter:
             self._work_total_costs = np.empty(self._max_children, dtype=np.float32)
             self._work_partial_costs = np.empty(self._max_children, dtype=np.float32)
             self._work_sharing_factors = np.empty(self._max_children, dtype=np.float32)
+
+        # Pre-allocate Numba heap arrays (reused across connections)
+        if self.use_numba_heap:
+            self._heap_max_size = 200000  # Match max_nodes in route_one_connection
+            self._heap_costs = np.empty(self._heap_max_size, dtype=np.float32)
+            self._heap_node_ids = np.empty(self._heap_max_size, dtype=np.int32)
+            self._heap_size = 0  # Current heap size
 
     def route_one_connection(
         self,
@@ -246,7 +260,16 @@ class AStarRouter:
                 node_map = graph.node_map
                 children_iter = [node_map[nid] for nid in child_node_ids if nid in node_map]
             else:
+                # No CSR - must use rnode.children (may be empty in worker processes!)
+                # SAFETY: In multiprocessing mode, children lists are empty.
+                # This should never happen because prepare_database_state requires CSR.
                 children_iter = rnode.children
+                if not children_iter and hasattr(graph, 'csr_indptr'):
+                    # Defensive: If children empty but CSR exists, use CSR
+                    start_idx = graph.csr_indptr[rnode.id]
+                    end_idx = graph.csr_indptr[rnode.id + 1]
+                    child_node_ids = graph.csr_indices[start_idx:end_idx]
+                    children_iter = [graph.node_map[nid] for nid in child_node_ids if nid in graph.node_map]
 
             # Python fallback loop (only runs if Numba disabled or failed)
             for child_rnode in children_iter:
