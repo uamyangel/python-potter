@@ -180,12 +180,75 @@ class AStarRouter:
                 start_idx = graph.csr_indptr[rnode.id]
                 end_idx = graph.csr_indptr[rnode.id + 1]
                 child_node_ids = graph.csr_indices[start_idx:end_idx]
-                # Use node_map for lookup (ids may not be sequential)
+                
+                # NUMBA BATCH EVALUATION - Main acceleration point
+                if self._use_numba and len(child_node_ids) > 0:
+                    try:
+                        # Convert to numpy array for Numba
+                        child_ids_array = np.array(child_node_ids, dtype=np.int32)
+                        
+                        # Batch evaluate using Numba (FAST!)
+                        result = self._expand_children_numba(
+                            child_ids_array,
+                            connection,
+                            net,
+                            ninfo_partial_cost
+                        )
+                        
+                        if result is not None:
+                            valid_ids, total_costs, partial_costs = result
+                            
+                            # Process all valid children
+                            for i in range(len(valid_ids)):
+                                child_id = valid_ids[i]
+                                child_rnode = graph.node_map.get(child_id)
+                                if child_rnode is None:
+                                    continue
+                                
+                                # Check if already visited (Python manages visited set)
+                                if isinstance(node_infos, NodeScratch):
+                                    if node_infos.visited[child_id] == connection_unique_id:
+                                        continue
+                                else:
+                                    child_info = node_infos.get(child_id)
+                                    if child_info and child_info.is_visited == connection_unique_id:
+                                        continue
+                                
+                                # Check if this is the sink (target found!)
+                                if child_id == connection.sink_node.id:
+                                    target_rnode = child_rnode
+                                    # Set predecessor for path reconstruction
+                                    if isinstance(node_infos, NodeScratch):
+                                        node_infos.prev[child_id] = rnode.id
+                                    else:
+                                        child_info = node_infos.get(child_id)
+                                        if child_info is None:
+                                            child_info = NodeInfo()
+                                            node_infos[child_id] = child_info
+                                        child_info.prev = rnode
+                                    break
+                                
+                                # Push to priority queue
+                                push(child_rnode, rnode, total_costs[i], partial_costs[i], -1)
+                            
+                            # Check if target found
+                            if target_rnode is not None:
+                                break
+                            
+                            # Skip Python loop - Numba handled everything
+                            continue
+                            
+                    except Exception as e:
+                        # Fallback to Python if Numba fails
+                        log(f"WARNING: Numba batch evaluation failed: {e}, falling back to Python")
+                
+                # Use node_map for lookup (ids may not be sequential) - FALLBACK
                 node_map = graph.node_map
                 children_iter = [node_map[nid] for nid in child_node_ids if nid in node_map]
             else:
                 children_iter = rnode.children
 
+            # Python fallback loop (only runs if Numba disabled or failed)
             for child_rnode in children_iter:
                 if isinstance(node_infos, NodeScratch):
                     is_visited = (node_infos.visited[child_rnode.id] == connection_unique_id)
@@ -490,6 +553,13 @@ class AStarRouter:
         num_children = len(child_ids)
         if num_children == 0:
             return (np.array([], dtype=np.int32), np.array([], dtype=np.float32), np.array([], dtype=np.float32))
+
+        # Debug: Log first few calls to verify Numba is active
+        if not hasattr(self, '_numba_call_count'):
+            self._numba_call_count = 0
+        self._numba_call_count += 1
+        if self._numba_call_count <= 3:
+            log(f"DEBUG: Numba batch evaluation called (#{self._numba_call_count}) with {num_children} children")
 
         # Resize work arrays if needed
         if num_children > len(self._work_valid):
